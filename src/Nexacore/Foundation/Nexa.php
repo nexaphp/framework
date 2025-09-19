@@ -1,364 +1,365 @@
 <?php
-/**
- * NexaPHP Application wrapper (app.php)
- *
- * - Provides a Laravel-like application class for a Slim 4 project.
- * - Integrates PHP-DI, Slim Bridge, Twig view, Monolog and common middleware.
- * - Defines standard paths (base, app, config, public, storage, views, logs)
- *
- * Usage:
- *   $app = NexaPHP\App::create(__DIR__);
- *   $slim = $app->getSlimApp();
- *   $slim->get('/hello', fn($req, $res) => $res->getBody()->write('Hello'));
- *   $slim->run();
- *
- * Requirements (composer packages):
- *  - slim/slim:^4
- *  - php-di/php-di:^6
- *  - php-di/slim-bridge
- *  - slim/twig-view
- *  - monolog/monolog
- *  - psr/log, nyholm/psr7 or laminas/laminas-diactoros for PSR-7 implementation
- *
- */
 
-namespace NexaPHP;
+namespace Nexacore\Foundation;
 
 use DI\Container;
 use DI\ContainerBuilder;
-use DI\Bridge\Slim\Bridge as SlimBridge;
-use Monolog\Logger;
-use Monolog\Handler\StreamHandler;
-use Monolog\Handler\RotatingFileHandler;
-use Monolog\Processor\UidProcessor;
-use Psr\Log\LoggerInterface;
-use Slim\App as SlimApp;
-use Slim\Exception\HttpNotFoundException;
-use Slim\Middleware\ErrorMiddleware;
-use Slim\Views\Twig;
-use Slim\Views\TwigMiddleware;
+use Slim\App;
+use Slim\Factory\AppFactory;
+use Nexacore\Contracts\Providers\ServiceProvider;
+use Psr\Container\ContainerInterface;
+use RuntimeException;
 
-class App
+/**
+ * NexaPHP Application Core
+ *
+ * Concrete implementation of the Application interface.
+ * This class serves as the central wrapper for the Slim framework.
+ *
+ * @package Nexacore\Foundation
+ */
+class Nexa implements Application
 {
-    /** @var string */
-    protected string $basePath;
-
-    /** @var array<string,string> */
-    protected array $paths = [];
-
-    /** @var Container */
-    protected Container $container;
-
-    /** @var SlimApp */
-    protected SlimApp $slim;
-
-    /** @var Logger */
-    protected Logger $logger;
+    /**
+     * The Slim application instance.
+     *
+     * @var App
+     */
+    protected $slim;
 
     /**
-     * Create an application instance
+     * The DI container instance.
      *
-     * @param string $basePath Path to project root (where composer.json lives)
-     * @param array $options Optional overrides:
-     *   - env: array of environment variables to set
-     *   - container: DI ContainerBuilder options
+     * @var Container
      */
-    public static function create(string $basePath, array $options = []): self
+    protected $container;
+
+    /**
+     * The base path of the application.
+     *
+     * @var string
+     */
+    protected $basePath;
+
+    /**
+     * Indicates if the application has been bootstrapped.
+     *
+     * @var bool
+     */
+    protected $bootstrapped = false;
+
+    /**
+     * All of the registered service providers.
+     *
+     * @var ServiceProvider[]
+     */
+    protected $loadedProviders = [];
+
+    /**
+     * Create a new NexaPHP application instance.
+     *
+     * @param string|null $basePath
+     */
+    public function __construct(?string $basePath = null)
     {
-        return new self($basePath, $options);
+        $this->basePath = $basePath ?: dirname(__DIR__, 3);
+        $this->bootstrapContainer();
+        $this->bootstrapSlim();
+        $this->registerBaseBindings();
     }
 
     /**
-     * App constructor: build paths, container, logger, slim app
+     * Bootstrap the DI container.
      *
-     * @param string $basePath
-     * @param array $options
+     * @return void
      */
-    public function __construct(string $basePath, array $options = [])
-    {
-        $this->basePath = rtrim($basePath, DIRECTORY_SEPARATOR);
-        $this->definePaths();
-
-        // Optionally set environment variables from $options
-        if (isset($options['env']) && is_array($options['env'])) {
-            foreach ($options['env'] as $k => $v) {
-                putenv("{$k}={$v}");
-                $_ENV[$k] = $v;
-            }
-        }
-
-        // Build container
-        $this->buildContainer($options['container'] ?? []);
-
-        // Initialize core services
-        $this->setupLogger();
-        $this->setupTwig();
-
-        // Create Slim app via PHP-DI bridge
-        $this->slim = SlimBridge::create($this->container);
-
-        // Register middleware pipeline
-        $this->registerDefaultMiddleware();
-
-        // Bind commonly used instances into container if not already
-        $this->container->set(App::class, $this);
-        $this->container->set('config.paths', $this->paths);
-    }
-
-    /**
-     * Define standard paths (Laravel-like)
-     */
-    protected function definePaths(): void
-    {
-        $this->paths = [
-            'base'    => $this->basePath,
-            'app'     => $this->basePath . DIRECTORY_SEPARATOR . 'app',
-            'config'  => $this->basePath . DIRECTORY_SEPARATOR . 'config',
-            'public'  => $this->basePath . DIRECTORY_SEPARATOR . 'public',
-            'resources' => $this->basePath . DIRECTORY_SEPARATOR . 'resources',
-            'views'   => $this->basePath . DIRECTORY_SEPARATOR . 'resources' . DIRECTORY_SEPARATOR . 'views',
-            'storage' => $this->basePath . DIRECTORY_SEPARATOR . 'storage',
-            'logs'    => $this->basePath . DIRECTORY_SEPARATOR . 'storage' . DIRECTORY_SEPARATOR . 'logs',
-            'cache'   => $this->basePath . DIRECTORY_SEPARATOR . 'storage' . DIRECTORY_SEPARATOR . 'cache',
-        ];
-
-        // Ensure directories exist (best-effort)
-        foreach ($this->paths as $p) {
-            if (!is_dir($p)) {
-                @mkdir($p, 0755, true);
-            }
-        }
-    }
-
-    /**
-     * Build PHP-DI container
-     *
-     * @param array \$containerOptions Options forwarded to ContainerBuilder
-     */
-    protected function buildContainer(array $containerOptions = []): void
+    protected function bootstrapContainer(): void
     {
         $builder = new ContainerBuilder();
-        if (!empty($containerOptions['definitions'])) {
-            $builder->addDefinitions($containerOptions['definitions']);
+        
+        if ($this->isProduction()) {
+            $builder->enableCompilation($this->storagePath('framework/cache'));
         }
-        if (!empty($containerOptions['autowire']) && $containerOptions['autowire'] === false) {
-            // noop: default autowiring remains
-        }
-
-        // Enable compilation if prod
-        if (getenv('APP_ENV') === 'production' && !empty($containerOptions['compile'])) {
-            $compilePath = $this->paths['cache'] . DIRECTORY_SEPARATOR . 'php-di';
-            $builder->enableCompilation($compilePath);
-        }
-
+        
+        $builder->addDefinitions($this->getDefaultContainerDefinitions());
         $this->container = $builder->build();
     }
 
     /**
-     * Setup Monolog logger and register in container
-     * - RotatingFileHandler (daily) to storage/logs/nexaphp.log
-     * - StreamHandler for stdout (useful in containers)
-     */
-    protected function setupLogger(): void
-    {
-        $name = getenv('APP_NAME') ?: 'nexaphp';
-        $level = Logger::DEBUG;
-        $logFile = $this->paths['logs'] . DIRECTORY_SEPARATOR . 'nexaphp.log';
-
-        $logger = new Logger($name);
-        $logger->pushProcessor(new UidProcessor());
-
-        // Rotating file keeps daily logs
-        $rotating = new RotatingFileHandler($logFile, 7, $level);
-        $stream = new StreamHandler('php://stdout', $level);
-
-        $logger->pushHandler($rotating);
-        $logger->pushHandler($stream);
-
-        $this->logger = $logger;
-
-        // bind logger into container
-        if ($this->container instanceof Container) {
-            $this->container->set(LoggerInterface::class, $logger);
-            $this->container->set(Logger::class, $logger);
-        }
-    }
-
-    /**
-     * Setup Twig view and register middleware
-     */
-    protected function setupTwig(): void
-    {
-        $viewsPath = $this->paths['views'];
-        if (!is_dir($viewsPath)) {
-            @mkdir($viewsPath, 0755, true);
-        }
-
-        $twig = Twig::create($viewsPath, ['cache' => $this->paths['cache'] . DIRECTORY_SEPARATOR . 'twig']);
-
-        // Register in container for later retrieval
-        if ($this->container instanceof Container) {
-            $this->container->set(Twig::class, $twig);
-        }
-
-        // Add Twig middleware to Slim if already created
-        if (isset($this->slim) && $this->slim instanceof SlimApp) {
-            $this->slim->add(TwigMiddleware::createFromContainer($this->slim, Twig::class));
-        }
-    }
-
-    /**
-     * Register the default middleware stack
-     */
-    protected function registerDefaultMiddleware(): void
-    {
-        // Must add routing middleware for Slim 4
-        $this->slim->addRoutingMiddleware();
-
-        // Body parsing
-        if (class_exists('\Slim\Middleware\BodyParsingMiddleware')) {
-            $this->slim->addBodyParsingMiddleware();
-        }
-
-        // Error handling middleware
-        $displayErrorDetails = (bool) (getenv('APP_DEBUG') === 'true' || getenv('APP_ENV') === 'development');
-        $logErrors = true;
-        $logErrorDetails = true;
-
-        $errorMiddleware = new ErrorMiddleware(
-            $this->slim->getCallableResolver(),
-            $this->slim->getResponseFactory(),
-            $displayErrorDetails,
-            $logErrors,
-            $logErrorDetails
-        );
-
-        // Example: you can add a custom error handler for 404
-        $errorMiddleware->setErrorHandler(
-            HttpNotFoundException::class,
-            function ($request, $exception, $displayErrorDetails, $logErrors) {
-                $responseFactory = $this->slim->getResponseFactory();
-                $response = $responseFactory->createResponse(404);
-                $response->getBody()->write('Not Found');
-                return $response;
-            }
-        );
-
-        $this->slim->add($errorMiddleware);
-
-        // Optionally add logging middleware that uses our logger
-        if ($this->container->has(LoggerInterface::class)) {
-            $logger = $this->container->get(LoggerInterface::class);
-            $this->slim->add(function ($request, $handler) use ($logger) {
-                $logger->info('http.request', [
-                    'method' => $request->getMethod(),
-                    'uri' => (string)$request->getUri(),
-                ]);
-
-                return $handler->handle($request);
-            });
-        }
-
-        // CORS or other middleware can be registered by the user using registerMiddleware()
-    }
-
-    /**
-     * Register an arbitrary middleware (callable or PSR-15)
+     * Bootstrap the Slim application.
      *
-     * @param callable|object $middleware
+     * @return void
      */
-    public function registerMiddleware($middleware): void
+    protected function bootstrapSlim(): void
     {
-        $this->slim->add($middleware);
+        AppFactory::setContainer($this->container);
+        $this->slim = AppFactory::create();
+        
+        $this->container->set(App::class, $this->slim);
+        $this->container->set(Application::class, $this);
+        $this->container->set(Nexa::class, $this);
     }
 
     /**
-     * Attach additional service definitions to the container
+     * Register the basic bindings into the container.
      *
-     * @param array $definitions
+     * @return void
      */
-    public function addDefinitions(array $definitions): void
+    protected function registerBaseBindings(): void
     {
-        if ($this->container instanceof Container) {
-            // Note: PHP-DI Container doesn't have addDefinitions after build, so we recompile a new builder
-            $builder = new ContainerBuilder();
-            $builder->addDefinitions($definitions);
-            // Merge existing container entries by rebuilding isn't trivial; simple approach: set each key value
-            foreach ($definitions as $key => $val) {
-                $this->container->set($key, $val);
-            }
+        $this->container->set('app', $this);
+        $this->container->set(ContainerInterface::class, $this->container);
+    }
+
+    /**
+     * Get the default container definitions.
+     *
+     * @return array
+     */
+    protected function getDefaultContainerDefinitions(): array
+    {
+        return [
+            // Application paths
+            'path.base' => $this->basePath(),
+            'path.config' => $this->configPath(),
+            'path.database' => $this->databasePath(),
+            'path.public' => $this->publicPath(),
+            'path.storage' => $this->storagePath(),
+            'path.resources' => $this->resourcePath(),
+            'path.routes' => $this->routesPath(),
+
+            // Application instances
+            'slim.app' => \DI\get(App::class),
+            'nexa.app' => \DI\get(Nexa::class),
+            
+            // Framework configuration
+            'config' => \DI\factory(function () {
+                return require $this->configPath('app.php');
+            }),
+        ];
+    }
+
+    /**
+     * Register a service provider with the application.
+     *
+     * @param string|ServiceProvider $provider
+     * @param bool $force
+     * @return ServiceProvider
+     */
+    public function register($provider, bool $force = false): ServiceProvider
+    {
+        if (($registered = $this->getProvider($provider)) && !$force) {
+            return $registered;
+        }
+
+        if (is_string($provider)) {
+            $provider = $this->resolveProvider($provider);
+        }
+
+        if (!$provider instanceof ServiceProvider) {
+            throw new RuntimeException(
+                'Service provider must implement Nexacore\Foundation\Providers\ServiceProvider'
+            );
+        }
+
+        $provider->register($this->container);
+
+        if ($this->isBooted()) {
+            $this->bootProvider($provider);
+        }
+
+        $this->markAsRegistered($provider);
+
+        return $provider;
+    }
+
+    /**
+     * Resolve a service provider instance from the class name.
+     *
+     * @param string $provider
+     * @return ServiceProvider
+     */
+    public function resolveProvider(string $provider): ServiceProvider
+    {
+        return new $provider();
+    }
+
+    /**
+     * Mark the given provider as registered.
+     *
+     * @param ServiceProvider $provider
+     * @return void
+     */
+    protected function markAsRegistered(ServiceProvider $provider): void
+    {
+        $this->loadedProviders[get_class($provider)] = $provider;
+    }
+
+    /**
+     * Bootstrap the application's service providers.
+     *
+     * @return void
+     */
+    public function boot(): void
+    {
+        if ($this->isBooted()) {
+            return;
+        }
+
+        array_walk($this->loadedProviders, function ($provider) {
+            $this->bootProvider($provider);
+        });
+
+        $this->bootstrapped = true;
+    }
+
+    /**
+     * Boot the given service provider.
+     *
+     * @param ServiceProvider $provider
+     * @return void
+     */
+    protected function bootProvider(ServiceProvider $provider): void
+    {
+        $provider->boot($this->container);
+    }
+
+    /**
+     * Get the registered service provider instance if it exists.
+     *
+     * @param string|ServiceProvider $provider
+     * @return ServiceProvider|null
+     */
+    public function getProvider($provider): ?ServiceProvider
+    {
+        $name = is_string($provider) ? $provider : get_class($provider);
+        return $this->loadedProviders[$name] ?? null;
+    }
+
+    /**
+     * Get the registered service provider instances.
+     *
+     * @return ServiceProvider[]
+     */
+    public function getProviders(): array
+    {
+        return $this->loadedProviders;
+    }
+
+    /**
+     * Determine if the application has been bootstrapped.
+     *
+     * @return bool
+     */
+    public function isBooted(): bool
+    {
+        return $this->bootstrapped;
+    }
+
+    /**
+     * Register all of the configured providers.
+     *
+     * @return void
+     */
+    public function registerConfiguredProviders(): void
+    {
+        $providers = $this->container->get('config')['providers'] ?? [];
+
+        foreach ($providers as $provider) {
+            $this->register($provider);
         }
     }
 
-    /**
-     * Get the underlying Slim app instance
-     */
-    public function getSlimApp(): SlimApp
+    // Implement all the path methods from the interface
+    public function basePath(string $path = ''): string
+    {
+        return $this->joinPaths($this->basePath, $path);
+    }
+
+    public function configPath(string $path = ''): string
+    {
+        return $this->joinPaths($this->basePath, 'config', $path);
+    }
+
+    public function databasePath(string $path = ''): string
+    {
+        return $this->joinPaths($this->basePath, 'database', $path);
+    }
+
+    public function publicPath(string $path = ''): string
+    {
+        return $this->joinPaths($this->basePath, 'public', $path);
+    }
+
+    public function storagePath(string $path = ''): string
+    {
+        return $this->joinPaths($this->basePath, 'storage', $path);
+    }
+
+    public function resourcePath(string $path = ''): string
+    {
+        return $this->joinPaths($this->basePath, 'resources', $path);
+    }
+
+    public function routesPath(string $path = ''): string
+    {
+        return $this->joinPaths($this->basePath, 'routes', $path);
+    }
+
+    public function version(): string
+    {
+        return '1.0.0';
+    }
+
+    public function environment(): string
+    {
+        return $_ENV['APP_ENV'] ?? 'production';
+    }
+
+    public function isProduction(): bool
+    {
+        return $this->environment() === 'production';
+    }
+
+    public function runningInConsole(): bool
+    {
+        return php_sapi_name() === 'cli' || php_sapi_name() === 'phpdbg';
+    }
+
+    public function getSlim(): App
     {
         return $this->slim;
     }
 
-    /**
-     * Get the DI container
-     */
     public function getContainer(): Container
     {
         return $this->container;
     }
 
-    /**
-     * Get Monolog logger
-     */
-    public function getLogger(): Logger
+    public function setBasePath(string $path): void
     {
-        return $this->logger;
+        $this->basePath = rtrim($path, DIRECTORY_SEPARATOR);
+    }
+
+    // Implement ContainerInterface methods
+    public function get($id)
+    {
+        return $this->container->get($id);
+    }
+
+    public function has($id): bool
+    {
+        return $this->container->has($id);
     }
 
     /**
-     * Helper to register routes file
-     * Expects a routes file that accepts the Slim app as argument: function(SlimApp $app) { ... }
+     * Join the given paths together.
+     *
+     * @param string ...$paths
+     * @return string
      */
-    public function loadRoutes(string $routesFile): void
+    protected function joinPaths(...$paths): string
     {
-        if (file_exists($routesFile)) {
-            $cb = require $routesFile;
-            if (is_callable($cb)) {
-                $cb($this->slim);
-            }
-        }
+        return implode(DIRECTORY_SEPARATOR, array_filter($paths));
     }
-
-    /**
-     * Register service providers (simple implementation pattern)
-     * Each provider is an object with a register(Container \$container) method.
-     */
-    public function registerProvider(object $provider): void
-    {
-        if (method_exists($provider, 'register')) {
-            $provider->register($this->container);
-        }
-    }
-
-    /**
-     * Simple config loader (PHP returning array from config/*.php)
-     */
-    public function config(string $key, $default = null)
-    {
-        $parts = explode('.', $key);
-        $file = array_shift($parts);
-        $configFile = $this->paths['config'] . DIRECTORY_SEPARATOR . $file . '.php';
-
-        if (!file_exists($configFile)) return $default;
-
-        $config = require $configFile;
-        foreach ($parts as $p) {
-            if (!is_array($config) || !array_key_exists($p, $config)) return $default;
-            $config = $config[$p];
-        }
-
-        return $config;
-    }
-
 }
-
-// End of NexaPHP App class
